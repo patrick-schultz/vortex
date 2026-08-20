@@ -30,7 +30,9 @@ use object_store::ObjectStore;
 use object_store::path::Path;
 use tokio_stream::wrappers::ReceiverStream;
 use vortex::array::stream::ArrayStreamAdapter;
+use vortex::compressor::BtrBlocksCompressorBuilder;
 use vortex::file::WriteOptionsSessionExt;
+use vortex::file::WriteStrategyBuilder;
 use vortex::file::WriteSummary;
 use vortex::io::VortexWrite;
 use vortex::io::object_store::ObjectStoreWrite;
@@ -42,6 +44,7 @@ pub struct VortexSink {
     config: FileSinkConfig,
     schema: SchemaRef,
     session: VortexSession,
+    use_compact_encodings: bool,
     metrics: ExecutionPlanMetricsSet,
     rows_written: Count,
     bytes_written: Count,
@@ -62,10 +65,17 @@ impl VortexSink {
             config,
             schema,
             session,
+            use_compact_encodings: false,
             metrics,
             rows_written,
             bytes_written,
         }
+    }
+
+    /// Configures whether writes prefer smaller files through compact encodings.
+    pub(crate) fn with_compact_encodings(mut self, use_compact_encodings: bool) -> Self {
+        self.use_compact_encodings = use_compact_encodings;
+        self
     }
 }
 
@@ -125,6 +135,11 @@ impl FileSink for VortexSink {
     ) -> DFResult<u64> {
         let mut file_write_tasks: JoinSet<DFResult<(Path, WriteSummary)>> = JoinSet::new();
         let writer_schema = get_writer_schema(&self.config);
+        let write_strategy = self.use_compact_encodings.then(|| {
+            WriteStrategyBuilder::default()
+                .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                .build()
+        });
         let dtype = self
             .session
             .arrow()
@@ -138,6 +153,7 @@ impl FileSink for VortexSink {
         while let Some((path, rx)) = file_stream_rx.recv().await {
             let session = self.session.clone();
             let object_store = Arc::clone(&object_store);
+            let write_strategy = write_strategy.clone();
 
             // We need to spawn work because there's a dependency between the different files. If one file has too many batches buffered,
             // the demux task might deadlock itself.
@@ -157,8 +173,11 @@ impl FileSink for VortexSink {
                     .await
                     .map_err(|e| exec_datafusion_err!("Failed to create ObjectStoreWrite: {e}"))?;
 
-                let summary = session
-                    .write_options()
+                let mut write_options = session.write_options();
+                if let Some(write_strategy) = write_strategy {
+                    write_options = write_options.with_strategy(write_strategy);
+                }
+                let summary = write_options
                     .write(&mut object_writer, stream_adapter)
                     .await
                     .map_err(|e| exec_datafusion_err!("Failed to write Vortex file: {e}"))?;
@@ -214,6 +233,7 @@ mod tests {
     use arrow_schema::DataType;
     use arrow_schema::Field;
     use arrow_schema::Schema;
+    use datafusion::arrow::array::Float64Array;
     use datafusion::arrow::array::Int8Array;
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::array::RecordBatch;
@@ -237,7 +257,12 @@ mod tests {
     use datafusion_physical_plan::empty::EmptyExec;
     use futures::TryStreamExt;
     use rstest::rstest;
+    use vortex::VortexSessionDefault;
+    use vortex::array::stream::ArrayStreamExt;
+    use vortex::file::OpenOptionsSessionExt;
     use vortex::file::VORTEX_FILE_EXTENSION;
+    use vortex::io::object_store::ObjectStoreReadAt;
+    use vortex::io::runtime::Handle;
     use vortex::session::VortexSession;
 
     use super::*;
@@ -297,6 +322,78 @@ mod tests {
                 "+-------+----+",
             ],
             &batches
+        );
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_compact_encodings_table_option(
+        #[case] use_compact_encodings: bool,
+    ) -> anyhow::Result<()> {
+        let ctx = TestSessionContext::default();
+        let mut rng_state = 110_u64;
+        let values = (0..16_384)
+            .map(|_| {
+                rng_state = rng_state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (rng_state >> 11) as f64 / (1_u64 << 53) as f64
+            })
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Float64,
+                false,
+            )])),
+            vec![Arc::new(Float64Array::from(values))],
+        )?;
+        ctx.session.register_batch("source", batch)?;
+
+        ctx.session
+            .sql(&format!(
+                "CREATE EXTERNAL TABLE compact_table \
+                    (value DOUBLE NOT NULL) \
+                STORED AS vortex \
+                LOCATION 'compact/' \
+                OPTIONS(use_compact_encodings '{use_compact_encodings}');",
+            ))
+            .await?;
+        ctx.session
+            .sql("INSERT INTO compact_table SELECT value FROM source")
+            .await?
+            .collect()
+            .await?;
+
+        let files = ctx.store.list(None).try_collect::<Vec<_>>().await?;
+        let file = files
+            .iter()
+            .find(|file| file.location.extension() == Some(VORTEX_FILE_EXTENSION))
+            .ok_or_else(|| anyhow::anyhow!("compact table did not produce a Vortex file"))?;
+        let reader = Arc::new(ObjectStoreReadAt::new(
+            Arc::clone(&ctx.store),
+            file.location.clone(),
+            Handle::find().ok_or_else(|| anyhow::anyhow!("tokio runtime is unavailable"))?,
+        ));
+        let array = VortexSession::default()
+            .open_options()
+            .with_file_size(file.size)
+            .open_read(reader)
+            .await?
+            .scan()?
+            .into_array_stream()?
+            .read_all()
+            .await?;
+        assert_eq!(
+            array
+                .depth_first_traversal()
+                .any(|node| node.encoding_id().as_ref() == "vortex.pco"),
+            use_compact_encodings,
+            "the written array does not match the compact-encoding option"
         );
 
         Ok(())

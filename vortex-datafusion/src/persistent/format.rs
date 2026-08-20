@@ -228,6 +228,11 @@ extensions_options! {
         /// with `SET vortex.scan_concurrency = <n>`, or per table with
         /// `OPTIONS(scan_concurrency '<n>')`.
         pub scan_concurrency: Option<usize>, default = None
+        /// Whether to prefer compact encodings when writing Vortex files.
+        ///
+        /// Compact encodings trade some read throughput and latency for smaller files.
+        /// Disabled by default.
+        pub use_compact_encodings: bool, default = false
     }
 }
 
@@ -754,7 +759,10 @@ impl FileFormat for VortexFormat {
         }
 
         let schema = Arc::clone(conf.output_schema());
-        let sink = Arc::new(VortexSink::new(conf, schema, self.session.clone()));
+        let sink = Arc::new(
+            VortexSink::new(conf, schema, self.session.clone())
+                .with_compact_encodings(self.opts.use_compact_encodings),
+        );
 
         Ok(Arc::new(DataSinkExec::new(input, sink, order_requirements)) as _)
     }
