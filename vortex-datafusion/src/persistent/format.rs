@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -691,6 +692,7 @@ impl FileFormat for VortexFormat {
                     stats_set.get(Stat::Min),
                     stats_dtype,
                     &target_dtype,
+                    field.data_type(),
                 );
 
                 let max = scalar_stat_to_df(
@@ -698,6 +700,7 @@ impl FileFormat for VortexFormat {
                     stats_set.get(Stat::Max),
                     stats_dtype,
                     &target_dtype,
+                    field.data_type(),
                 );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
@@ -791,6 +794,7 @@ fn scalar_stat_to_df(
     value: Precision<VortexScalarValue>,
     stats_dtype: &DType,
     target_dtype: &DType,
+    target_arrow_dtype: &DataType,
 ) -> Precision<DFScalarValue> {
     let Some(stat_dtype) = stat.dtype(stats_dtype) else {
         return Precision::Absent;
@@ -800,7 +804,11 @@ fn scalar_stat_to_df(
         .map(|stat_value| {
             Scalar::try_new(stat_dtype, Some(stat_value))?
                 .cast(target_dtype)?
-                .try_to_df()
+                .try_to_df()?
+                .cast_to(target_arrow_dtype)
+                .map_err(|error| {
+                    vortex_err!("Failed to cast statistic to {target_arrow_dtype}: {error}")
+                })
         })
         .transpose()
         .unwrap_or(Precision::Absent)
@@ -812,6 +820,8 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use arrow_array::Int32Array;
+    use arrow_array::RecordBatch;
+    use arrow_array::StringViewArray;
     use arrow_schema::DataType;
     use arrow_schema::Field;
     use datafusion_common::ScalarValue;
@@ -821,7 +831,13 @@ mod tests {
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_plan::filter_pushdown::PushedDown;
+    use object_store::ObjectStoreExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
     use vortex::expr::Expression;
+    use vortex::file::WriteOptionsSessionExt;
+    use vortex::io::VortexWrite;
+    use vortex::io::object_store::ObjectStoreWrite;
 
     use super::*;
     use crate::common_tests::TestSessionContext;
@@ -916,6 +932,50 @@ mod tests {
         assert!(calls.can_be_pushed_down.load(Ordering::Relaxed));
         assert!(!calls.convert.load(Ordering::Relaxed));
         assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_infer_stats_matches_requested_arrow_type() -> anyhow::Result<()> {
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let path = Path::parse("stats/file.vortex")?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringViewArray::from(vec!["beta", "alpha"]))],
+        )?;
+        let session = VortexSession::default();
+        let array = session.arrow().from_arrow_record_batch(batch, &schema)?;
+        let mut writer = ObjectStoreWrite::new(Arc::clone(&object_store), &path).await?;
+        session
+            .write_options()
+            .write(&mut writer, array.to_array_stream())
+            .await?;
+        writer.shutdown().await?;
+        let object = object_store.head(&path).await?;
+        let ctx = TestSessionContext::default();
+
+        let statistics = VortexFormat::new(session)
+            .infer_stats(
+                &ctx.session.state(),
+                &object_store,
+                Arc::clone(&schema),
+                &object,
+            )
+            .await?;
+
+        assert_eq!(
+            statistics.column_statistics[0].min_value,
+            DFPrecision::Exact(ScalarValue::Utf8View(Some("alpha".to_string())))
+        );
+        assert_eq!(
+            statistics.column_statistics[0].max_value,
+            DFPrecision::Exact(ScalarValue::Utf8View(Some("beta".to_string())))
+        );
         Ok(())
     }
 
